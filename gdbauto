@@ -3,6 +3,20 @@
 require "io"
 require "os"
 
+local rl = require "readline"
+rl.set_options{keeplines=1000, histfile='./.gdbauto_history'}
+rl.set_readline_name('gdbauto')
+
+local rl_clst = {
+	"macro", "recbegin", "recsave",
+
+	"run", "backtrace", "where", "bt", "frame", "delete",
+	"up", "down", "select-frame", "return", "print",
+	"call", "append", "dump", "explore", "find",
+	"record", "monitor", "watch", "awatch", "rwatch"
+}
+rl.set_complete_list(rl_clst)
+
 local args = {...}
 local progname = table.concat(args, " ");
 if #progname == 0 then
@@ -15,9 +29,8 @@ if not (mainproc) then
 end
 
 local macros = {}
-local f = io.open(".gdbautomacros", "r+");
+local f = io.open(".gdbautomacros", "r");
 if f then
-	local name, body
 	while true do
 		local name = f:read("*line")
 		local body = f:read("*line")
@@ -27,30 +40,62 @@ if f then
 		end
 		macros[name] = body
 	end
-else
-	f = io.open(".gdbautomacros", "w+");
-	if not f then
-		error("failed to open macros file")
-	end
+	f:close();
+end
+for k, v in pairs(macros) do
+	table.insert(rl_clst, k)
 end
 
-while true do
-	local line = io.read("*line");
-	if line == "q" then
-		mainproc:write("q\ny\n");
-		mainproc:flush();
-		break;
-	end
-	if line == "macro" then
-		io.write("name: ")
-		local name = io.read("*line")
-		io.write("(rec) ")
-		local body = io.read("*line")
-		macros[name] = body
+local recording = false;
+local recdata = {}
 
-		mainproc:write("\n");
+local function repl_main(line)
+	if recording then
+		table.insert(recdata, line);
+	end
+	if line == "exit" then
+		mainproc:write("exit\ny\n");
 		mainproc:flush();
-		goto continue
+		return true;
+	end
+	if line:sub(1, 5) == "macro" then
+		if line:find("new", 5) then
+			local name = rl.readline("name: ");
+			local body = rl.readline("(rec) ");
+			macros[name] = body
+			table.insert(rl_clst, name)
+		elseif line:find("del", 5) then
+			local name = rl.readline("name: ");
+			macros[name] = nil
+			for i, v in ipairs(rl_clst) do
+				if v == name then
+					rl_clst[i] = nil
+					break
+				end
+			end
+		else
+			print("usage:\n> macro new\n> macro del")
+		end
+		return
+	end
+	if line:sub(1, 8) == "recbegin" then
+		print("(gdbauto) started recording")
+		recording = true;
+		return
+	end
+	if line:sub(1, 7) == "recsave" then
+		recording = false;
+		local recfile = io.open(".gdbautoinit", "w");
+		if not recfile then
+			print("error: unable to write recording")
+			return
+		end
+		local recd = table.concat(recdata, "\n")
+		recfile:write(recd)
+		recfile:close()
+		recdata = {}
+		print("(gdbauto) finished recording")
+		return
 	end
 	if macros[line] then
 		line = macros[line]
@@ -58,16 +103,32 @@ while true do
 
 	mainproc:write(line .. "\n");
 	mainproc:flush();
-	::continue::
+end
+
+local f = io.open(".gdbautoinit", "r");
+if f then
+	while true do
+		local line = f:read("*line")
+		if not line then
+			break
+		end
+		repl_main(line);
+	end
+	f:close();
+end
+
+while true do
+	local line = rl.readline("(gdb) ");
+	if repl_main(line) then
+		break
+	end
 end
 
 mainproc:close();
 
-f:seek("set", 0)
+local f = io.open(".gdbautomacros", "w");
 for k, v in pairs(macros) do
 	f:write(k .. "\n")
 	f:write(v .. "\n")
 end
-print("exiting")
-
-return 0;
+rl.save_history();
