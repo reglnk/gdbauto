@@ -1,0 +1,73 @@
+#!/bin/lua
+
+require "io"
+require "os"
+
+local args = {...}
+local progname = table.concat(args, " ");
+if #progname == 0 then
+	error("command required")
+end
+
+local mainproc = io.popen("gdb " .. progname, "w")
+if not (mainproc) then
+	error("failed to open process")
+end
+
+local macros = {}
+local f = io.open(".gdbautomacros", "r+");
+if f then
+	local name, body
+	while true do
+		local name = f:read("*line")
+		local body = f:read("*line")
+
+		if not (name and body) then
+			break
+		end
+		macros[name] = body
+	end
+else
+	f = io.open(".gdbautomacros", "w+");
+	if not f then
+		error("failed to open macros file")
+	end
+end
+
+while true do
+	local line = io.read("*line");
+	if line == "q" then
+		mainproc:write("q\ny\n");
+		mainproc:flush();
+		break;
+	end
+	if line == "macro" then
+		io.write("name: ")
+		local name = io.read("*line")
+		io.write("(rec) ")
+		local body = io.read("*line")
+		macros[name] = body
+
+		mainproc:write("\n");
+		mainproc:flush();
+		goto continue
+	end
+	if macros[line] then
+		line = macros[line]
+	end
+
+	mainproc:write(line .. "\n");
+	mainproc:flush();
+	::continue::
+end
+
+mainproc:close();
+
+f:seek("set", 0)
+for k, v in pairs(macros) do
+	f:write(k .. "\n")
+	f:write(v .. "\n")
+end
+print("exiting")
+
+return 0;
