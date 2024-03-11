@@ -1,14 +1,44 @@
 #!/bin/lua
 
+--[[
+@todo: multiline macros, instead of changing .gdbautoinit's for different paths of execution
+@todo: while recording .gdbautoinit, some optimizations may be made
+remove 'bt', 'backtrace', 'f'
+
+prevent downgrade of UX:
+don't remove 'p' as it may involve complex expressions
+don't remove subsequent 'up' and 'down' as it could be top or bottom of stack
+
+btw these suggestions for prevention downgrading of UX may have separate tag, like @saveux
+]]
+
 require "io"
 require "os"
+
+function string.split(self, delim, limit)
+	local arr = {}
+	local iter = 1
+	while iter <= #self do
+		if limit then
+			if limit == 0 then break
+			else limit = limit - 1 end
+		end
+		local st, en = self:find(delim, iter)
+		if st and en ~= 0 then
+			table.insert(arr, self:sub(iter, st - 1))
+			iter = en + 1
+		else break end
+	end
+	table.insert(arr, self:sub(iter, #self))
+	return arr
+end
 
 local rl = require "readline"
 rl.set_options{keeplines=1000, histfile='./.gdbauto_history'}
 rl.set_readline_name('gdbauto')
 
 local rl_clst = {
-	"macro", "recbegin", "recsave",
+	"macro", "recbegin", "recsave", "recundo", "recload", "recdiscard", "exit",
 
 	"run", "backtrace", "where", "bt", "frame", "delete",
 	"up", "down", "select-frame", "return", "print",
@@ -28,7 +58,37 @@ if not (mainproc) then
 	error("failed to open process")
 end
 
+--[[ ============================= ]]
+
+local function read_record(path)
+	path = path or ".gdbautoinit";
+	local f = io.open(path, "r");
+	local p = {}
+	if f then
+		while true do
+			local line = f:read("*line")
+			if not line then
+				break
+			end
+			table.insert(p, line);
+		end
+		f:close();
+		return p
+	end
+	return nil
+end
+
 local macros = {}
+local function make_macro(name, body)
+	local func = load("return function" .. body .. " end");
+	if not func then
+		print("(gal) failed to create macro")
+		return nil
+	end
+	macros[name] = {body = body, fn = func()};
+	table.insert(rl_clst, name)
+end
+
 local f = io.open(".gdbautomacros", "r");
 if f then
 	while true do
@@ -38,7 +98,7 @@ if f then
 		if not (name and body) then
 			break
 		end
-		macros[name] = body
+		make_macro(name, body);
 	end
 	f:close();
 end
@@ -48,22 +108,47 @@ end
 
 local recording = false;
 local recdata = {}
+local reccustom = {}
+
+local function recsave(num)
+	num = num or "";
+	recording = false;
+	local recfile = io.open(".gdbautoinit" .. num, "w");
+	if not recfile then
+		print("error: unable to write recording")
+		return
+	end
+	local recd = table.concat(recdata, "\n")
+	recfile:write(recd)
+	recfile:close()
+	recdata = {}
+	print("(gal) finished recording")
+end
 
 local function repl_main(line)
-	if recording then
-		table.insert(recdata, line);
+	if line:sub(1, 7) == "recsave" then
+		local num = tonumber(line:sub(8))
+		if num then
+			print("(gal) saving as .gdbautoinit" .. num)
+		else num = nil end
+		return recsave(num)
 	end
 	if line == "exit" then
 		mainproc:write("exit\ny\n");
 		mainproc:flush();
+		if recording and #recdata ~= 0 then
+			recsave()
+		end
 		return true;
+	end
+	if recording then
+		table.insert(recdata, line);
 	end
 	if line:sub(1, 5) == "macro" then
 		if line:find("new", 5) then
 			local name = rl.readline("name: ");
-			local body = rl.readline("(rec) ");
-			macros[name] = body
-			table.insert(rl_clst, name)
+			local body = rl.readline("> ");
+			make_macro(name, body);
 		elseif line:find("del", 5) then
 			local name = rl.readline("name: ");
 			macros[name] = nil
@@ -78,47 +163,70 @@ local function repl_main(line)
 		end
 		return
 	end
-	if line:sub(1, 8) == "recbegin" then
-		print("(gdbauto) started recording")
+	if line == "recbegin" then
+		print("(gal) started recording")
 		recording = true;
 		return
 	end
-	if line:sub(1, 7) == "recsave" then
+	if line == "recdiscard" then
+		print("(gal) stopped recording")
 		recording = false;
-		local recfile = io.open(".gdbautoinit", "w");
-		if not recfile then
-			print("error: unable to write recording")
-			return
-		end
-		local recd = table.concat(recdata, "\n")
-		recfile:write(recd)
-		recfile:close()
-		recdata = {}
-		print("(gdbauto) finished recording")
+		recdata = {};
 		return
 	end
-	if macros[line] then
-		line = macros[line]
+	if line == "recundo" then
+		recdata[#recdata] = nil
+		print("(gal) undone")
+		return
+	end
+	if line:sub(1, 7) == "recload" then
+		local num = tonumber(line:sub(8))
+		if not num then
+			print("usage: recload<num>")
+			return
+		end
+		if reccustom[num] then
+			for i, v in ipairs(reccustom[num]) do
+				repl_main(v);
+			end
+			return
+		end
+		local rec = read_record(".gdbautoinit" .. num);
+		if not rec then
+			print("failed to load record " .. num)
+			return
+		end
+		reccustom[num] = rec
+		for i, v in ipairs(rec) do
+			repl_main(v);
+		end
+		return
+	end
+
+	local sp = line:find(" ")
+	local cmd = sp and line:sub(1, sp - 1) or line
+	if macros[cmd] then
+		local args = sp and line:sub(sp + 1):split(" ") or {}
+		local result = macros[cmd].fn(table.unpack(args))
+		print("(gal) macro expanded to: " .. tostring(result));
+		if result then
+			line = result
+		end
 	end
 
 	mainproc:write(line .. "\n");
 	mainproc:flush();
 end
 
-local f = io.open(".gdbautoinit", "r");
-if f then
-	while true do
-		local line = f:read("*line")
-		if not line then
-			break
-		end
-		repl_main(line);
+local init = read_record();
+if init then
+	for i, v in ipairs(init) do
+		repl_main(v);
 	end
-	f:close();
 end
 
 while true do
-	local line = rl.readline("(gdb) ");
+	local line = rl.readline("(gal) ");
 	if repl_main(line) then
 		break
 	end
@@ -129,6 +237,6 @@ mainproc:close();
 local f = io.open(".gdbautomacros", "w");
 for k, v in pairs(macros) do
 	f:write(k .. "\n")
-	f:write(v .. "\n")
+	f:write(v.body .. "\n")
 end
 rl.save_history();
