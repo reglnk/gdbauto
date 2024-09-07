@@ -477,11 +477,7 @@ function repl_main(line)
 		vprint(1, "(gal) undone")
 		return
 	end
-	
-	if recording and norec == 0 then
-		table.insert(recdata, line);
-	end
-	
+
 	if cmd == "macro" then
 		if line:find("new", 5) then
 			local name = rl.readline("name: ");
@@ -505,6 +501,11 @@ function repl_main(line)
 		parse_preproc(line, true);
 		return
 	end
+	
+	if recording and norec == 0 then
+		table.insert(recdata, line);
+	end
+	
 	if cmd == "/exec" then
 		local code = load("return function(o)"..line:sub(6).." end");
 		return code()(vars);
