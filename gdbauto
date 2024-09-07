@@ -1,21 +1,36 @@
 #!/bin/lua
 
 --[[
-@todo: multiline macros, instead of changing .gdbautoinit's for different paths of execution
-@todo: while recording .gdbautoinit, some optimizations may be made
+@todo: multiline macros, instead of changing .gdbautorec's for different paths of execution
+@todo: while recording .gdbautorec, some optimizations may be made
 remove 'bt', 'backtrace', 'f'
 
-prevent downgrade of UX:
+preventing downgrade of UX:
 don't remove 'p' as it may involve complex expressions
 don't remove subsequent 'up' and 'down' as it could be top or bottom of stack
 
-btw these suggestions for prevention downgrading of UX may have separate tag, like @saveux
+@todo: like C defines but 'enum' defines, or defines group
+for checking if a number matches some group and finding its #definition
+
+@todo: recundo with argument for multiple times
+@todo: recsave without finishing
 ]]
 
 require "io"
 require "os"
 
-function string.split(self, delim, limit)
+VERSION = "1.0.0"
+API_VER = 1
+verb = 2
+
+function vprint(level, ...)
+	if verb < level then return end
+	print(...)
+end
+
+--[[ ============== extensions ============== ]]
+
+function string:split(delim, limit)
 	local arr = {}
 	local iter = 1
 	while iter <= #self do
@@ -33,13 +48,82 @@ function string.split(self, delim, limit)
 	return arr
 end
 
+function string:at(ind)
+	return string.sub(self, ind, ind)
+end
+
+function string:fsub(s, b)
+	local sb, se = string.find(self, s, b);
+	if not sb then
+		return nil;
+	end
+	return string.sub(self, sb, se)
+end
+
+--[[ ======================================== ]]
+
+-- a table instead of switch() in C
+local whitespace = {
+	[' '] = true,
+	['\t'] = true,
+	['\n'] = true,
+	['\r'] = true
+};
+
+-- trim whitespace by both sides of string
+function trim(s)
+	local b, e;
+	local i = 1
+	while i <= #s do
+		if not whitespace[s:at(i)] then
+			break
+		end
+		i = i + 1
+	end
+	b = i
+	i = #s
+	while i > 0 do
+		if not whitespace[s:at(i)] then
+			break
+		end
+		i = i - 1
+	end
+	e = i
+	return s:sub(b, e)
+end
+
 local rl = require "readline"
 rl.set_options{keeplines=1000, histfile='./.gdbauto_history'}
 rl.set_readline_name('gdbauto')
 
 local rl_clst = {
-	"macro", "recbegin", "recsave", "recundo", "recload", "recdiscard", "exit",
+	"macro", -- define a macro with such syntax: (arg1, arg2) return arg1 .. arg2
 
+	-- A recording is a history of commands but more structured than the one for autocompletion
+	-- Default file for saving is .gdbautorec_default
+	-- When gdbauto starts running, it starts recording. You can change this
+	"recbegin", -- begin a recording (if not yet)
+	"recsave", -- save the current recording: `recsave bug1` to save as .gdbautorec_bug1 or use default
+	"recundo", -- erase last command from recording
+	"recload", -- load recording (specify as in recsave)
+	"recdiscard",
+
+	-- set or get verbosity.
+	-- 2: verbose
+	-- 1: not so verbose
+	-- 0: print only errors and specifically requested info
+	-- -1: only critical errors
+	"verb",
+
+	"exit", -- exits and saves history by default
+	"nosave", -- write after 'exit' or 'q' to not save recording
+
+	"/fr", -- force to record one command
+	"/nr", -- don't record one command
+	"/exec", -- execute Lua code
+	"#define", -- use C preprocessor (subset of it, so far)
+
+	-- gdb commands (@todo add more commands)
 	"run", "backtrace", "where", "bt", "frame", "delete",
 	"up", "down", "select-frame", "return", "print",
 	"call", "append", "dump", "explore", "find",
@@ -48,20 +132,19 @@ local rl_clst = {
 rl.set_complete_list(rl_clst)
 
 local args = {...}
-local progname = table.concat(args, " ");
-if #progname == 0 then
+local forward = table.concat(args, " ");
+if #forward == 0 then
 	error("command required")
 end
 
-local mainproc = io.popen("gdb " .. progname, "w")
+local mainproc = io.popen("gdb " .. forward, "w")
 if not (mainproc) then
 	error("failed to open process")
 end
 
 --[[ ============================= ]]
 
-local function read_record(path)
-	path = path or ".gdbautoinit";
+function read_record(path)
 	local f = io.open(path, "r");
 	local p = {}
 	if f then
@@ -78,18 +161,135 @@ local function read_record(path)
 	return nil
 end
 
-local macros = {}
-local function make_macro(name, body)
+macros = {}
+cmacros = {}
+cdefines = {}
+
+-- for ones added in current session
+cmacros_new = {}
+cdefines_new = {}
+
+function make_macro(name, body)
 	local func = load("return function" .. body .. " end");
 	if not func then
-		print("(gal) failed to create macro")
-		return nil
+		vprint(0, "(gal) failed to create macro")
+		return
+	end
+	if cmacros[name] then
+		vprint(0, "(gal) error: conflict with C macro " .. name)
+		return
 	end
 	macros[name] = {body = body, fn = func()};
 	table.insert(rl_clst, name)
+	return true
 end
 
-local f = io.open(".gdbautomacros", "r");
+-- gen N spaces
+function genempty(n)
+	local s = " "
+	while #s * 2 < n do
+		s = s .. s
+	end
+	if #s < n then
+		s = s .. genempty(n - #s)
+	end
+	return s
+end
+
+function parse_preproc(source, newdef)
+	assert(source:sub(1,7) == "#define")
+	if not whitespace[source:at(8)] then
+		vprint(0, "(gal) preprocessor syntax error");
+		return
+	end
+	local def = source:sub(8) -- "itype(o)	((uint32_t)((o)->it64 >> 47))"
+
+	local b, e = def:find("[^ \t()]+");
+	local name = def:sub(b, e);
+	local b2, e2 = def:find("[a-zA-Z_][a-zA-Z_0-9]*");
+	if not (b == b2 and e == e2) then
+		vprint(0, "(gal) preprocessor syntax error");
+		return
+	end
+	def = def:sub(e + 1)
+	
+	-- values                 b   e   wb  we
+	-- #define foo bar        nil nil nil nil
+	-- #define foo(x) bar     1   3   nil nil
+	-- #define foo (x)        2   4   1   4
+	-- #define foo            nil nil nil nil
+	-- #define foo(x) (x * x) 1   3   4   11
+	
+	b, e = def:find("%b()");
+	local wb, we = def:find("[ \t]+%b()");
+	if (wb and e == we) or not b then
+		if cdefines[name] and not newdef then
+			error("redefinition of " .. name)
+		end
+		cdefines[name] = {def = source, val = trim(def)};
+		cdefines_new[name] = newdef
+		table.insert(rl_clst, name)
+		if newdef then
+			vprint(3, "(gal) defined ".. name)
+		end
+		return true
+	end
+
+	local argnames = {}
+	do
+		local ind = b
+		while ind < e do
+			local ab, ae = def:find("[a-zA-Z_][a-zA-Z_0-9]*", ind)
+			if not ab then break end
+			argnames[def:sub(ab, ae)] = true
+			ind = ae + 1
+		end
+	end
+	
+	local code = "return function"
+	code = code .. def:sub(b, e)
+	def = '"' .. trim(def:sub(e + 1):gsub("\"", "\\\"")) .. '"'
+	do
+		local ind = 1
+		while true do
+			local sb, se = def:find("\\\".*\\\"", ind) -- bounds of nearest string
+			local vb, ve = def:find("[a-zA-Z_][a-zA-Z_0-9]*", ind) -- bounds of nearest variable
+			if not (sb or vb) then break end
+			if not vb or (sb and sb < vb) then
+				ind = se + 1
+			else
+				local vn = def:sub(vb, ve);
+				if argnames[vn] then
+					def = def:sub(1, vb - 1) .. "\".. " .. def:sub(vb, ve) .. " ..\"" .. def:sub(ve + 1)
+					ind = ve + 9
+				else
+					ind = ve + 1
+				end
+			end
+		end
+	end
+	code = (code .. " return " .. def .. " end");
+	local func = load(code);
+	if not func then
+		vprint(0, "(gal) failed to create macro")
+		return nil
+	end
+	if macros[name] then
+		vprint(1, "(gal) warning: conflict with macro " .. name)
+	end
+	if cmacros[name] and not newdef then
+		error("redefinition of " .. name)
+	end
+	cmacros[name] = {def = source, fn = func()};
+	cmacros_new[name] = newdef
+	table.insert(rl_clst, name)
+	if newdef then
+		vprint(3, "(gal) macro ".. name .." added")
+	end
+	return true
+end
+
+local f = io.open(".gdbauto_macros", "r");
 if f then
 	while true do
 		local name = f:read("*line")
@@ -106,45 +306,183 @@ for k, v in pairs(macros) do
 	table.insert(rl_clst, k)
 end
 
-local recording = false;
-local recdata = {}
-local reccustom = {}
+cmacros_mod = false -- config modified by user?
+cmacros_lc = false -- is last line a comment?
+local f = io.open(".gdbauto_cmacros", "r");
+if f then
+	local count = 0
+	while true do
+		local def = f:read("*line")
+		if not def then
+			break
+		end
+		if #def > 0 then
+			cmacros_lc = def:sub(1, 2) == "//";
+		end
+		if cmacros_lc then
+			cmacros_mod = true
+		elseif #def > 0 then
+			count = count + (parse_preproc(def) and 1 or 0);
+		end
+	end
+	f:close();
+	vprint(2, "(gal) imported ".. count .." C macros")
+end
+for k, v in pairs(cmacros) do
+	table.insert(rl_clst, k)
+end
 
-local function recsave(num)
-	num = num or "";
+recording = true;
+recdata = {};
+reccustom = {};
+
+function recnext()
+	local num = 0
+	while num < 20 do
+		num = num + 1
+		local f = io.open(".gdbautorec_n" .. num);
+		if f then
+			f:close();
+		else
+			return num
+		end
+	end
+	return 0
+end
+
+function recsave(id)
+	id = id or "default";
+	if id == "$next" then
+		id = "n" .. recnext();
+	end
+	vprint(1, "(gal) saving as .gdbautorec_" .. id)
 	recording = false;
-	local recfile = io.open(".gdbautoinit" .. num, "w");
+	local recfile = io.open(".gdbautorec_" .. id, "w");
 	if not recfile then
-		print("error: unable to write recording")
+		vprint(0, "error: unable to write recording")
 		return
 	end
 	local recd = table.concat(recdata, "\n")
 	recfile:write(recd)
 	recfile:close()
 	recdata = {}
-	print("(gal) finished recording")
+	vprint(1, "(gal) finished recording")
 end
 
-local function repl_main(line)
-	if line:sub(1, 7) == "recsave" then
-		local num = tonumber(line:sub(8))
-		if num then
-			print("(gal) saving as .gdbautoinit" .. num)
-		else num = nil end
-		return recsave(num)
+function macro_eval(code)
+	local ind = 1
+	while true do
+		local sb, se = code:find("\".*\"", ind) -- bounds of nearest string
+		local vb, ve = code:find("[a-zA-Z_][a-zA-Z_0-9]*", ind) -- bounds of nearest variable
+		if not (sb or vb) then break end
+		if not vb or (sb and sb < vb) then
+			ind = se + 1
+		else
+			local vn = code:sub(vb, ve);
+			local macro, def = macros[vn] or cmacros[vn], cdefines[vn]
+			if not (macro or def) then
+				ind = ve + 1
+				goto continue
+			end
+			
+			local argb, arge = code:find("%b()", ve + 1)
+			local gb, ge = code:find("[ \t]*%(", ve + 1) -- check that the found brackets belong to this identifier
+			if (not argb) or gb ~= ve + 1 or ge ~= argb
+			then -- it's plain non-function-like macro
+				if def then
+					local result = macro_eval(def.val)
+					code = code:sub(1, vb - 1) .. result .. code:sub(ve + 1);
+					ind = vb + #result + 1;
+				else
+					ind = ve + 1
+				end
+				goto continue
+			end
+			
+			-- evaluating macro
+			local arglist = code:sub(argb + 1, arge - 1);
+			arglist = arglist:split(","); -- @todo consider the case that strings contain commas
+			for i = 1, #arglist do
+				arglist[i] = macro_eval(arglist[i])
+			end
+			
+			local result = macro.fn(table.unpack(arglist));
+			code = code:sub(1, vb - 1) .. result .. code:sub(arge + 1);
+			ind = vb
+		end
+		::continue::
 	end
-	if line == "exit" then
+	return code
+end
+
+function repl_main(line)
+	local norec, forcerec;
+	line, forcerec = line:gsub("/fr[ \t]*", "");
+	line, norec = line:gsub("/nr[ \t]*", "");
+	local cmdb, cmde = line:find("[^ \t]+");
+	local cmd = cmdb and line:sub(cmdb, cmde);
+
+	if recording and forcerec ~= 0 then
+		norec = -1;
+		table.insert(recdata, line);
+	end
+	
+	if cmd == "exit" or cmd == "q" then
 		mainproc:write("exit\ny\n");
 		mainproc:flush();
+		if line:fsub("[^ \t]+", #cmd + 1) == "nosave" then
+			return true;
+		end
 		if recording and #recdata ~= 0 then
 			recsave()
 		end
 		return true;
 	end
-	if recording then
+	if cmd == "recsave" then
+		return recsave(line:fsub("[^ \t]+", 8));
+	end
+	if cmd == "recbegin" then
+		vprint(1, "(gal) started recording")
+		recording = true;
+		return
+	end
+	if cmd == "recdiscard" then
+		vprint(1, "(gal) stopped recording")
+		recording = false;
+		recdata = {};
+		return
+	end
+	if cmd == "recload" then
+		local argb1, arge1 = line:find("[^ \t]+", 8);
+		local id = argb1 and line:sub(argb1, arge1) or "default";
+		if reccustom[id] then
+			for i, v in ipairs(reccustom[id]) do
+				repl_main(v);
+			end
+			return
+		end
+		local rec = read_record(".gdbautorec_" .. id);
+		if not rec then
+			vprint(1, "failed to load .gdbautorec_" .. id)
+			return
+		end
+		reccustom[id] = rec
+		for i, v in ipairs(rec) do
+			repl_main(v);
+		end
+		return
+	end
+	if cmd == "recundo" then
+		recdata[#recdata] = nil
+		vprint(1, "(gal) undone")
+		return
+	end
+	
+	if recording and norec == 0 then
 		table.insert(recdata, line);
 	end
-	if line:sub(1, 5) == "macro" then
+	
+	if cmd == "macro" then
 		if line:find("new", 5) then
 			local name = rl.readline("name: ");
 			local body = rl.readline("> ");
@@ -159,69 +497,57 @@ local function repl_main(line)
 				end
 			end
 		else
-			print("usage:\n> macro new\n> macro del")
+			vprint(0, "usage:\n> macro new\n> macro del")
 		end
 		return
 	end
-	if line == "recbegin" then
-		print("(gal) started recording")
-		recording = true;
+	if line:sub(1, 7) == "#define" then
+		parse_preproc(line, true);
 		return
 	end
-	if line == "recdiscard" then
-		print("(gal) stopped recording")
-		recording = false;
-		recdata = {};
+	if cmd == "/exec" then
+		local code = load("return function(o)"..line:sub(6).." end");
+		return code()(vars);
+	end
+	if cmd == "verb" then
+		local argb1, arge1 = line:find("[^ \t]+", 5);
+		local arg1 = argb1 and line:sub(argb1, arge2) or ""
+		if arg1 == "" then vprint(1, verb) return end
+		local vv = tonumber(arg1);
+		verb = (vv and vv >= 0 and vv < 5) and vv or 2;
 		return
 	end
-	if line == "recundo" then
-		recdata[#recdata] = nil
-		print("(gal) undone")
-		return
-	end
-	if line:sub(1, 7) == "recload" then
-		local num = tonumber(line:sub(8))
-		if not num then
-			print("usage: recload<num>")
-			return
+	if cmd == "p" then
+		local ind = 1;
+		local prev = trim(line):gsub("[ ]+", " ")
+		local result = trim("p " .. macro_eval(line:sub(2))):gsub("[ ]+", " ");;
+		if prev ~= result then
+			vprint(2, "(gal) macro expanded to: " .. tostring(result));
 		end
-		if reccustom[num] then
-			for i, v in ipairs(reccustom[num]) do
-				repl_main(v);
-			end
-			return
-		end
-		local rec = read_record(".gdbautoinit" .. num);
-		if not rec then
-			print("failed to load record " .. num)
-			return
-		end
-		reccustom[num] = rec
-		for i, v in ipairs(rec) do
-			repl_main(v);
-		end
-		return
-	end
-
-	local sp = line:find(" ")
-	local cmd = sp and line:sub(1, sp - 1) or line
-	if macros[cmd] then
-		local args = sp and line:sub(sp + 1):split(" ") or {}
-		local result = macros[cmd].fn(table.unpack(args))
-		print("(gal) macro expanded to: " .. tostring(result));
 		if result then
 			line = result
 		end
+	else
+		local sp = line:find(" ")
+		if macros[cmd] or cmacros[cmd] then
+			local args = sp and line:sub(sp + 1):split(" ") or {}
+			local result = (macros[cmd] or cmacros[cmd]).fn(table.unpack(args))
+			vprint(2, "(gal) macro expanded to: " .. tostring(result));
+			if result then
+				line = result
+			end
+		end
 	end
-
 	mainproc:write(line .. "\n");
 	mainproc:flush();
 end
 
-local init = read_record();
+local init = read_record(".gdbautoinit");
 if init then
 	for i, v in ipairs(init) do
-		repl_main(v);
+		if v ~= "" then
+			repl_main(v);
+		end
 	end
 end
 
@@ -234,9 +560,34 @@ end
 
 mainproc:close();
 
-local f = io.open(".gdbautomacros", "w");
+local f = io.open(".gdbauto_macros", "w");
 for k, v in pairs(macros) do
 	f:write(k .. "\n")
 	f:write(v.body .. "\n")
 end
+f:close();
+
+if not cmacros_mod then
+	f = io.open(".gdbauto_cmacros", "w");
+	for k, v in pairs(cmacros) do
+		f:write(v.def .. "\n")
+	end
+	for k, v in pairs(cdefines) do
+		f:write(v.def .. "\n")
+	end
+	f:close()
+else
+	f = io.open(".gdbauto_cmacros", "a");
+	if not cmacros_lc and (next(cmacros_new) or next(cdefines_new)) then
+		f:write("\n// ================================\n")
+	end
+	for k, _ in pairs(cmacros_new) do
+		f:write(cmacros[k].def .. "\n")
+	end
+	for k, _ in pairs(cdefines_new) do
+		f:write(cdefines[k].def .. "\n")
+	end
+	f:close()
+end
+
 rl.save_history();
